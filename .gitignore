@@ -1,0 +1,36 @@
+# python bytecode
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# editor swap files
+*.swp
+*.swo
+*~
+.#*
+\#*#
+.idea/
+.vscode/
+
+# C build output
+src/wmi-set
+src/*.o
+
+# deb build outputs. Dpkg-buildpackage drops these next to the tree
+../ux435eg-screenpad_*.deb
+../ux435eg-screenpad_*.dsc
+../ux435eg-screenpad_*.tar.*
+../ux435eg-screenpad_*.changes
+../ux435eg-screenpad_*.buildinfo
+debian/.debhelper/
+debian/debhelper-build-stamp
+debian/files
+debian/ux435eg-screenpad/
+debian/*.substvars
+debian/*.log
+obj-*/
+
+# local diagnostic dumps
+/tmp/ux435-diagnose-*.log
+DSDT.dat
+DSDT.dsl
