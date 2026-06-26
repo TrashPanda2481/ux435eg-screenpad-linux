@@ -1,0 +1,302 @@
+#!/usr/bin/env python3
+# ux435-screenpad. Userspace SET/GET for the ASUS UX435EG ScreenPad
+#
+# Talks straight to \_SB.ATKD.WMNB via /proc/acpi/call (acpi_call kernel module).
+# Bypasses the in-kernel asus_wmi backlight class, which on this box registers
+# /sys/class/backlight/asus_screenpad but never actually binds writes to the
+# ATK WMI GUID. So writes there are silent no-ops.
+#
+# Requires: acpi_call kernel module loaded (Debian pkg: acpi-call-dkms).
+#
+# References (see src/README.md for the full brief):
+#   GUID     97845ED0-4E6D-11DE-8A39-0800200C9A66  (dispatched by WMNB in DSDT)
+#   DEVS     0x53564544  ('DEVS' LE)  . Set devstate
+#   DSTS     0x53545344  ('DSTS' LE)  . Get devstate
+#   POWER    0x00050031
+#   LIGHT    0x00050032
+#
+# Author: chris (github.com/TrashPanda2481).
+
+import argparse
+import errno
+import os
+import struct
+import sys
+from typing import Optional, Tuple
+
+ACPI_CALL = "/proc/acpi/call"
+WMNB_PATH = r"\_SB.ATKD.WMNB"
+
+METHODID_DEVS = 0x53564544
+METHODID_DSTS = 0x53545344
+
+DEVID_SCREENPAD_POWER = 0x00050031
+DEVID_SCREENPAD_LIGHT = 0x00050032
+
+# WMNB instance arg. UX435EG uses 0. Some ASUS boards expose >1 instance of the
+# GUID; if you're porting this to another model and get 0xFFFFFFFE back, try 1.
+WMI_INSTANCE = 0
+
+# Kernel's struct bios_args is 6 * u32 = 24 bytes __packed on current mainline
+# (grew from 2 -> 5 -> 6 dwords over the years. See commits 130d29c5627c and
+# 8d95d1f4aa5c). WMNB on non-ROG ZenBooks only inspects the first two, so any
+# padded length >= 8 bytes works. We default to 24 to match the current driver
+# exactly; --short flips it to the 8-byte form used by most out-of-tree hacks.
+BIOS_ARGS_LEN_FULL = 24
+BIOS_ARGS_LEN_SHORT = 8
+
+
+class ScreenpadError(Exception):
+    """Anything that stops us from talking to WMNB."""
+
+
+def build_buffer(dev_id: int, ctrl_param: int, length: int = BIOS_ARGS_LEN_FULL) -> bytes:
+    """Little-endian packed { u32 dev_id; u32 ctrl_param; u32 pad[...]; }."""
+    if length < 8 or length % 4 != 0:
+        raise ValueError(f"buffer length must be a multiple of 4 and >= 8, got {length}")
+    pad_dwords = (length - 8) // 4
+    return struct.pack("<II" + "I" * pad_dwords, dev_id & 0xFFFFFFFF,
+                       ctrl_param & 0xFFFFFFFF, *([0] * pad_dwords))
+
+
+def hexbuf(buf: bytes) -> str:
+    """acpi_call buffer literal: lowercase 'b' + hex nibbles, no spaces."""
+    return "b" + buf.hex()
+
+
+def check_acpi_call() -> None:
+    """Fail early with a useful message if the kernel module isn't there."""
+    if not os.path.exists(ACPI_CALL):
+        raise ScreenpadError(
+            f"{ACPI_CALL} does not exist.\n"
+            "The acpi_call kernel module isn't loaded. On Debian:\n"
+            "    sudo apt install acpi-call-dkms\n"
+            "    sudo modprobe acpi_call\n"
+            "Then re-run this command."
+        )
+    # Writable check happens at write time. We can't stat +w on /proc reliably.
+
+
+def call_wmnb(method_id: int, dev_id: int, ctrl_param: int,
+              buf_len: int = BIOS_ARGS_LEN_FULL,
+              debug: bool = False) -> int:
+    """
+    Invoke \\_SB.ATKD.WMNB(instance, method_id, buffer) via acpi_call.
+    Returns the integer status WMNB gives back.
+    """
+    check_acpi_call()
+
+    buf = build_buffer(dev_id, ctrl_param, buf_len)
+    cmd = f"{WMNB_PATH} {WMI_INSTANCE} 0x{method_id:08X} {hexbuf(buf)}"
+
+    if debug:
+        print(f"[debug] buffer     : {buf.hex()}", file=sys.stderr)
+        print(f"[debug] acpi_call  : {cmd}", file=sys.stderr)
+
+    # Write the invocation. acpi_call reads the whole write() as one command.
+    try:
+        with open(ACPI_CALL, "wb", buffering=0) as f:
+            f.write(cmd.encode("ascii"))
+    except PermissionError:
+        raise ScreenpadError(
+            f"permission denied writing to {ACPI_CALL}. Run as root (sudo)."
+        )
+    except OSError as e:
+        if e.errno == errno.ENOENT:
+            raise ScreenpadError(
+                f"{ACPI_CALL} vanished mid-call. Is acpi_call still loaded?"
+            )
+        raise ScreenpadError(f"write to {ACPI_CALL} failed: {e}")
+
+    # Read the reply. acpi_call returns a NUL-terminated ASCII string; typical
+    # forms are "0x0", "0x1", "Error: ...", or "not called" if the path was bad.
+    try:
+        with open(ACPI_CALL, "rb") as f:
+            raw = f.read()
+    except OSError as e:
+        raise ScreenpadError(f"read from {ACPI_CALL} failed: {e}")
+
+    reply = raw.split(b"\x00", 1)[0].decode("ascii", errors="replace").strip()
+    if debug:
+        print(f"[debug] reply raw  : {raw!r}", file=sys.stderr)
+        print(f"[debug] reply text : {reply!r}", file=sys.stderr)
+
+    return parse_reply(reply)
+
+
+def parse_reply(reply: str) -> int:
+    """
+    acpi_call replies:
+      "0x0" / "0x1" / "0x00010001" .... Success, integer status
+      "not called"                   . Path not found or module refused
+      "Error: ..."                   . ACPI evaluation error
+      ""                             . Nothing written yet (shouldn't happen here)
+    """
+    if not reply:
+        raise ScreenpadError("empty reply from /proc/acpi/call. Did the write succeed?")
+    if reply == "not called":
+        raise ScreenpadError(
+            f"acpi_call reports 'not called'. WMNB path {WMNB_PATH} may not "
+            "exist on this BIOS, or the module refused the call. "
+            "Verify with: grep -i WMNB /sys/firmware/acpi/tables/DSDT (after iasl -d)."
+        )
+    if reply.lower().startswith("error"):
+        raise ScreenpadError(f"ACPI error from WMNB: {reply}")
+    if reply.startswith("0x") or reply.startswith("0X"):
+        try:
+            return int(reply, 16)
+        except ValueError:
+            raise ScreenpadError(f"malformed hex reply: {reply!r}")
+    # Some acpi_call builds return plain decimal.
+    try:
+        return int(reply)
+    except ValueError:
+        raise ScreenpadError(f"unparseable reply: {reply!r}")
+
+
+# --------------------------- high-level operations ---------------------------
+
+def set_power(on: bool, buf_len: int = BIOS_ARGS_LEN_FULL, debug: bool = False) -> int:
+    return call_wmnb(METHODID_DEVS, DEVID_SCREENPAD_POWER, 1 if on else 0,
+                     buf_len=buf_len, debug=debug)
+
+
+def set_brightness(value: int, buf_len: int = BIOS_ARGS_LEN_FULL, debug: bool = False) -> int:
+    if not 0 <= value <= 255:
+        raise ScreenpadError(f"brightness must be 0-255, got {value}")
+    return call_wmnb(METHODID_DEVS, DEVID_SCREENPAD_LIGHT, value,
+                     buf_len=buf_len, debug=debug)
+
+
+def get_state(dev_id: int, buf_len: int = BIOS_ARGS_LEN_FULL, debug: bool = False) -> int:
+    """
+    DSTS on ASUS returns a u32 whose high bit (0x00010000 = 'present') means
+    'this devstate is supported', and the low bits are the current value.
+    We return the raw status; callers strip flags as needed.
+    """
+    # For DSTS, ctrl_param slot is 0. WMNB only uses arg0 (the devid).
+    return call_wmnb(METHODID_DSTS, dev_id, 0, buf_len=buf_len, debug=debug)
+
+
+def decode_dsts(status: int) -> Tuple[bool, Optional[int]]:
+    """
+    Returns (present, value). 'present' = the 0x00010000 bit; if that bit is
+    clear the value slot is meaningless (unsupported devstate). 'value' is
+    the low 16 bits.
+    """
+    present = bool(status & 0x00010000)
+    value = status & 0xFFFF
+    return present, value
+
+
+# --------------------------- CLI ---------------------------
+
+def cmd_power(args: argparse.Namespace) -> int:
+    on = args.state.lower() in ("on", "1", "true", "yes")
+    off = args.state.lower() in ("off", "0", "false", "no")
+    if not (on or off):
+        print(f"error: power state must be 'on' or 'off', got {args.state!r}",
+              file=sys.stderr)
+        return 2
+    status = set_power(on, buf_len=args.buf_len, debug=args.debug)
+    if args.debug:
+        print(f"[debug] status     : 0x{status:08X}", file=sys.stderr)
+    # Any non-error reply from WMNB counts as delivered. On UX435EG the
+    # observed success value is 0x1; some boards return 0x00010001 (present + 1).
+    print(f"power {'on' if on else 'off'} -> 0x{status:X}")
+    return 0
+
+
+def cmd_brightness(args: argparse.Namespace) -> int:
+    try:
+        value = int(args.value, 0)  # accept 0-255, 0x80, etc.
+    except ValueError:
+        print(f"error: brightness must be an integer, got {args.value!r}",
+              file=sys.stderr)
+        return 2
+    status = set_brightness(value, buf_len=args.buf_len, debug=args.debug)
+    if args.debug:
+        print(f"[debug] status     : 0x{status:08X}", file=sys.stderr)
+    print(f"brightness {value} -> 0x{status:X}")
+    return 0
+
+
+def cmd_get(args: argparse.Namespace) -> int:
+    power_status = get_state(DEVID_SCREENPAD_POWER,
+                             buf_len=args.buf_len, debug=args.debug)
+    light_status = get_state(DEVID_SCREENPAD_LIGHT,
+                             buf_len=args.buf_len, debug=args.debug)
+
+    p_present, p_value = decode_dsts(power_status)
+    l_present, l_value = decode_dsts(light_status)
+
+    if args.debug:
+        print(f"[debug] power DSTS : 0x{power_status:08X}", file=sys.stderr)
+        print(f"[debug] light DSTS : 0x{light_status:08X}", file=sys.stderr)
+
+    print(f"power      : {'on' if p_value else 'off'} "
+          f"(supported={p_present}, raw=0x{power_status:X})")
+    print(f"brightness : {l_value} "
+          f"(supported={l_present}, raw=0x{light_status:X})")
+    return 0
+
+
+def cmd_toggle(args: argparse.Namespace) -> int:
+    status = get_state(DEVID_SCREENPAD_POWER,
+                       buf_len=args.buf_len, debug=args.debug)
+    _, value = decode_dsts(status)
+    new_on = not bool(value)
+    if args.debug:
+        print(f"[debug] current    : {'on' if value else 'off'}", file=sys.stderr)
+    set_status = set_power(new_on, buf_len=args.buf_len, debug=args.debug)
+    print(f"toggle -> {'on' if new_on else 'off'} (0x{set_status:X})")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="ux435-screenpad",
+        description="Control the ASUS UX435EG ScreenPad via ACPI WMNB "
+                    "(bypasses the broken in-kernel backlight class).",
+    )
+    p.add_argument("--debug", action="store_true",
+                   help="print the raw acpi_call command and reply")
+    p.add_argument("--short", action="store_const",
+                   dest="buf_len", const=BIOS_ARGS_LEN_SHORT,
+                   default=BIOS_ARGS_LEN_FULL,
+                   help="use the 8-byte bios_args form (fallback if the "
+                        "default 24-byte form is rejected)")
+
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sp_power = sub.add_parser("power", help="turn the ScreenPad on or off")
+    sp_power.add_argument("state", help="on | off")
+    sp_power.set_defaults(func=cmd_power)
+
+    sp_bright = sub.add_parser("brightness", help="set ScreenPad brightness (0-255)")
+    sp_bright.add_argument("value", help="0-255 (accepts 0x80 etc)")
+    sp_bright.set_defaults(func=cmd_brightness)
+
+    sp_get = sub.add_parser("get", help="read current power + brightness via DSTS")
+    sp_get.set_defaults(func=cmd_get)
+
+    sp_toggle = sub.add_parser("toggle", help="flip power based on current state")
+    sp_toggle.set_defaults(func=cmd_toggle)
+
+    return p
+
+
+def main(argv=None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        return args.func(args)
+    except ScreenpadError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())
