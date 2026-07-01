@@ -1,0 +1,13 @@
+[Unit]
+Description=Restore ASUS ZenBook UX435EG ScreenPad state at boot
+After=multi-user.target
+Wants=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/ux435-screenpad power on
+ExecStart=/usr/local/bin/ux435-screenpad brightness 128
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

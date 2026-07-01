@@ -1,0 +1,19 @@
+# /etc/udev/rules.d/99-ux435-screenpad.rules
+#
+# Make the asus_screenpad backlight brightness node writable by the video group,
+# so unprivileged users can adjust ScreenPad brightness (matching the pattern
+# other backlight drivers use, e.g. intel_backlight).
+#
+# If the mainline asus_wmi driver never creates /sys/class/backlight/asus_screenpad
+# on this BIOS (which is the whole reason this package exists), these rules are
+# harmless no-ops. They kick in only if a future kernel starts populating it.
+
+ACTION=="add", SUBSYSTEM=="backlight", KERNEL=="asus_screenpad", \
+    RUN+="/bin/chgrp video /sys/class/backlight/%k/brightness", \
+    RUN+="/bin/chmod g+w /sys/class/backlight/%k/brightness"
+
+# Same treatment for the LED node the out-of-tree Plippo driver exposes,
+# in case someone has that installed alongside this package.
+ACTION=="add", SUBSYSTEM=="leds", KERNEL=="asus::screenpad", \
+    RUN+="/bin/chgrp video /sys/class/leds/%k/brightness", \
+    RUN+="/bin/chmod g+w /sys/class/leds/%k/brightness"
