@@ -1,0 +1,34 @@
+Source: ux435eg-screenpad
+Section: utils
+Priority: optional
+Maintainer: chris <chris@trashpanda2481.dev>
+Build-Depends: debhelper-compat (= 13)
+Standards-Version: 4.6.2
+Homepage: https://github.com/TrashPanda2481/ux435eg-screenpad
+Rules-Requires-Root: no
+
+Package: ux435eg-screenpad
+Architecture: all
+Depends:
+ ${misc:Depends},
+ python3,
+ acpi-call-dkms,
+ dkms
+Recommends:
+ acpica-tools
+Description: ScreenPad 2.0 control for the ASUS ZenBook UX435EG
+ Userspace tool + systemd unit for driving the ScreenPad 2.0 secondary panel
+ on the ASUS ZenBook UX435EG (Tiger Lake, BIOS UX435EG.315). Talks to the ATK
+ WMI method \_SB.ATKD.WMNB via acpi_call, bypassing the mainline asus_wmi
+ driver which does not bind the management GUID on this BIOS and leaves the
+ panel dark.
+ .
+ Provides:
+   * /usr/local/bin/ux435-screenpad - power on/off and set brightness (0..255)
+   * a oneshot systemd service that restores state at boot
+   * a udev rule granting the video group write access to the backlight node
+     (if a future kernel ever creates it)
+   * a diagnose script that dumps everything needed for a bug report
+ .
+ This is a workaround, not a proper driver. See docs/ for the reverse
+ engineering notes.

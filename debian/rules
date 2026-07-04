@@ -1,0 +1,13 @@
+#!/usr/bin/make -f
+# debian/rules for ux435eg-screenpad
+#
+# Nothing to build - all payloads are shell + a python script + config files.
+# dh_install handles the copy per debian/install.
+
+export DH_VERBOSE = 1
+
+%:
+	dh $@
+
+override_dh_installsystemd:
+	dh_installsystemd --name=ux435-screenpad-boot ux435-screenpad-boot.service

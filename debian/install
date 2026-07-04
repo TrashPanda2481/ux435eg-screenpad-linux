@@ -1,0 +1,4 @@
+src/ux435-screenpad                       usr/bin
+systemd/ux435-screenpad-boot.service      lib/systemd/system
+udev/99-ux435-screenpad.rules             lib/udev/rules.d
+scripts/diagnose.sh                       usr/share/ux435eg-screenpad
