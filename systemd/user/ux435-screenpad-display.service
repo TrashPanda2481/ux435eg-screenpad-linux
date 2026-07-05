@@ -1,0 +1,13 @@
+[Unit]
+Description=Rotate + position the UX435EG ScreenPad in the current X session
+After=graphical-session.target
+PartOf=graphical-session.target
+ConditionPathExists=/usr/local/bin/screenpad-display
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/screenpad-display
+RemainAfterExit=yes
+
+[Install]
+WantedBy=graphical-session.target
