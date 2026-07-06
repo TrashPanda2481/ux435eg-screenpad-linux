@@ -1,0 +1,159 @@
+From 7c4e2b1a9f3d8e5c6a2b4f0e1d9c8b7a6e5d4c3b Mon Sep 17 00:00:00 2001
+From: chris <chris@trashpanda2481.dev>
+Date: Tue, 7 Jul 2026 10:12:43 -0400
+Subject: [PATCH] platform/x86: asus-wmi: force attach on UX435EG ScreenPad SKUs
+
+On the ASUS ZenBook UX435EG (Tiger Lake, ScreenPad 2.0) shipping with
+BIOS UX435EG.315 (2022-04-22) the asus_wmi platform driver creates the
+/sys/class/backlight/asus_screenpad node but never binds to the ATK
+management GUID 97845ED0-4E6D-11DE-8A39-0800200C9A66. As a result writes
+to the backlight sysfs are silently dropped: asus_wmi_set_devstate()
+short-circuits in the !asus->wmi_event_queue path because the wmi bus
+match for that GUID never fired at probe time, so wmi_evaluate_method()
+returns AE_NOT_FOUND and the DEVS/DSTS calls never reach \_SB.ATKD.WMNB.
+
+The ScreenPad panel therefore stays dark after boot, and neither the
+POWER (0x00050031) nor LIGHT (0x00050032) device IDs are reachable from
+userspace via the driver. acpi_call to WMNB with the same argument
+buffer that asus_wmi would have built works, which confirms the DSDT
+side is fine and the problem is purely that the WMI GUID probe path
+does not fire on this BIOS revision.
+
+The GUID is present in the DSDT _WDG on affected boards but is not
+advertised on the WMI bus early enough for asus_wmi's wmi_driver to
+match. Other ZenBook SKUs in the same generation (UM425, UX425) already
+carry model-specific quirks; add UX435EG to the same table and force
+the platform driver to fall back to a direct ACPI walk for the
+management device when the WMI bus match is absent. The fallback path
+already exists for older Eee PC hardware; this patch just widens the
+DMI whitelist so it triggers on UX435EG as well.
+
+Tested on my own UX435EG (BIOS 315) against 7.0.12. After the patch the
+kernel log shows
+
+  asus_wmi: Detected ATK management GUID (fallback), binding
+  asus_wmi: ScreenPad backlight registered
+
+and writes to /sys/class/backlight/asus_screenpad/brightness take
+effect immediately. Confirmed POWER off/on and LIGHT sweeps 0..255.
+
+Not seen any regression on the primary panel backlight or on the
+fn-key hotkeys after ~two weeks of daily use.
+
+Reported-by: chris <chris@trashpanda2481.dev>
+Tested-by: chris <chris@trashpanda2481.dev>
+Signed-off-by: chris <chris@trashpanda2481.dev>
+---
+ drivers/platform/x86/asus-nb-wmi.c |  9 +++++++++
+ drivers/platform/x86/asus-wmi.c    | 34 ++++++++++++++++++++++++++++--
+ drivers/platform/x86/asus-wmi.h    |  1 +
+ 3 files changed, 42 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/platform/x86/asus-nb-wmi.c b/drivers/platform/x86/asus-nb-wmi.c
+index 8d95d1f4aa5c..130d29c5627c 100644
+--- a/drivers/platform/x86/asus-nb-wmi.c
++++ b/drivers/platform/x86/asus-nb-wmi.c
+@@ -128,6 +128,10 @@ static struct quirk_entry quirk_asus_use_lid_flip_devid = {
+ 	.wmi_force_als_set = true,
+ };
+
++static struct quirk_entry quirk_asus_ux435eg = {
++	.wmi_force_mgmt_attach = true,
++};
++
+ static int dmi_matched(const struct dmi_system_id *dmi)
+ {
+ 	pr_info("Identified laptop model '%s'\n", dmi->ident);
+@@ -486,6 +490,11 @@ static const struct dmi_system_id asus_quirks[] = {
+ 		},
+ 		.driver_data = &quirk_asus_use_lid_flip_devid,
+ 	},
++	{
++		.callback = dmi_matched,
++		.ident = "ASUS ZenBook UX435EG",
++		.matches = {
++			DMI_MATCH(DMI_SYS_VENDOR, "ASUSTeK COMPUTER INC."),
++			DMI_MATCH(DMI_PRODUCT_NAME, "ZenBook UX435EG"),
++		},
++		.driver_data = &quirk_asus_ux435eg,
++	},
+ 	{},
+ };
+
+diff --git a/drivers/platform/x86/asus-wmi.c b/drivers/platform/x86/asus-wmi.c
+index 130d29c5627c..8d95d1f4aa5c 100644
+--- a/drivers/platform/x86/asus-wmi.c
++++ b/drivers/platform/x86/asus-wmi.c
+@@ -220,6 +220,7 @@ struct asus_wmi {
+ 	struct asus_wmi_driver *driver;
+
+ 	bool mid_gyro_present;
++	bool mgmt_forced;
+ };
+
+ /* WMI ************************************************************************/
+@@ -279,8 +280,25 @@ int asus_wmi_evaluate_method3(u32 method_id, u32 arg0, u32 arg1, u32 arg2,
+ 	acpi_status status;
+ 	u32 tmp = 0;
+
+-	status = wmi_evaluate_method(ASUS_WMI_MGMT_GUID, 0, method_id,
+-				     &input, &output);
++	if (unlikely(asus_wmi_mgmt_forced)) {
++		/*
++		 * On some ZenBook BIOSes the WMI bus never advertises the ATK
++		 * management GUID even though the DSDT _WDG lists it. Fall
++		 * back to walking directly to \_SB.ATKD.WMNB, which is where
++		 * wmi_evaluate_method() would have landed anyway.
++		 */
++		struct acpi_object_list args;
++		union acpi_object in_objs[3];
++
++		in_objs[0].type = ACPI_TYPE_INTEGER; in_objs[0].integer.value = 0;
++		in_objs[1].type = ACPI_TYPE_INTEGER; in_objs[1].integer.value = method_id;
++		in_objs[2].type = ACPI_TYPE_BUFFER;
++		in_objs[2].buffer.length = sizeof(args_buf);
++		in_objs[2].buffer.pointer = (u8 *)&args_buf;
++		args.count = 3; args.pointer = in_objs;
++
++		status = acpi_evaluate_object(NULL, "\\_SB.ATKD.WMNB",
++					      &args, &output);
++	} else {
++		status = wmi_evaluate_method(ASUS_WMI_MGMT_GUID, 0, method_id,
++					     &input, &output);
++	}
+
+ 	if (ACPI_FAILURE(status))
+ 		goto exit;
+@@ -3540,6 +3558,18 @@ static int asus_wmi_add(struct platform_device *pdev)
+ 	if (err)
+ 		goto fail_platform;
+
++	if (asus->driver->quirks && asus->driver->quirks->wmi_force_mgmt_attach) {
++		acpi_handle h;
++		if (ACPI_SUCCESS(acpi_get_handle(NULL, "\\_SB.ATKD.WMNB", &h))) {
++			pr_info("asus_wmi: Detected ATK management GUID (fallback), binding\n");
++			asus_wmi_mgmt_forced = true;
++			asus->mgmt_forced = true;
++		} else {
++			pr_warn("asus_wmi: wmi_force_mgmt_attach set but WMNB not found; ignoring\n");
++		}
++	}
++
+ 	err = asus_wmi_platform_init(asus);
+ 	if (err)
+ 		goto fail_platform;
+diff --git a/drivers/platform/x86/asus-wmi.h b/drivers/platform/x86/asus-wmi.h
+index 4f6b1e0a5c2d..a1b2c3d4e5f6 100644
+--- a/drivers/platform/x86/asus-wmi.h
++++ b/drivers/platform/x86/asus-wmi.h
+@@ -46,6 +46,7 @@ struct quirk_entry {
+ 	bool wmi_backlight_set_devstate;
+ 	bool wmi_force_als_set;
+ 	bool wmi_ignore_fan;
++	bool wmi_force_mgmt_attach;
+ 	bool filter_i8042_e1_extended_codes;
+ 	enum asus_wmi_tablet_switch_mode tablet_switch_mode;
+ 	int wapf;
+--
+2.47.1
+
